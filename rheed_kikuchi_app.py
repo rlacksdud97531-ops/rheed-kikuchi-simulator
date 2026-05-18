@@ -294,13 +294,14 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
 
     ax.set_xlim(y_range)
     ax.set_ylim(z_range)
+    ax.invert_yaxis()   # shadow edge at top, matching paper convention
     ax.set_xlabel("Y  [mm]  (horizontal, perp beam)", color="white", fontsize=11)
-    ax.set_ylabel("Z  [mm]  (above surface)",         color="white", fontsize=11)
+    ax.set_ylabel("Z  [mm]  (distance from shadow edge)", color="white", fontsize=11)
     ax.tick_params(colors="white")
     for spine in ax.spines.values():
         spine.set_edgecolor("#555555")
     ax.axhline(0, color="#555555", lw=0.5, ls="--")
-    ax.text(y_min + 1, 0.5, "shadow edge", color="#888888", fontsize=7, va="bottom")
+    ax.text(y_min + 1, 0.5, "shadow edge", color="#888888", fontsize=7, va="top")
     ax.set_title(
         f"RHEED Kikuchi  --  {crystal_name} (001)  |  "
         f"E={energy_keV} keV   theta={theta_deg} deg   phi={azimuth_deg} deg   L={L_mm} mm",

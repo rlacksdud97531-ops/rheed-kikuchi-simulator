@@ -432,14 +432,15 @@ def plot_rheed(
               facecolor="#222222", labelcolor="white")
     ax.set_xlim(y_range_mm)
     ax.set_ylim(z_range_mm)
+    ax.invert_yaxis()   # shadow edge at top, matching paper convention
     ax.set_xlabel("Y  [mm]  (horizontal, perp beam)", color="white")
-    ax.set_ylabel("Z  [mm]  (above surface)",         color="white")
+    ax.set_ylabel("Z  [mm]  (distance from shadow edge)", color="white")
     ax.tick_params(colors="white")
     for spine in ax.spines.values():
         spine.set_edgecolor("#555555")
     ax.axhline(0, color="#555555", lw=0.5, ls="--")
     ax.text(y_range_mm[0] + 1, 0.5, "shadow edge", color="#888888",
-            fontsize=7, va="bottom")
+            fontsize=7, va="top")
 
     title = (f"RHEED Kikuchi -- {crystal_name} (001)  |  "
              f"E={energy_keV} keV  theta={theta_deg} deg  phi={azimuth_deg} deg  L={L_mm} mm")
