@@ -1,5 +1,6 @@
 """
 RHEED Kikuchi Line Simulator — Streamlit Web App
+Supports cubic & tetragonal crystals, substrate and epitaxial film modes.
 Based on:
   - Mitura et al., Acta Cryst. A80, 104-111 (2024)
   - Pawlak, Przybylski & Mitura, Materials 14, 7077 (2021)
@@ -15,7 +16,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import streamlit as st
-from pathlib import Path
 
 # ============================================================================
 #  Physical constants
@@ -25,11 +25,27 @@ m0   = 9.1093837015e-31
 qe   = 1.602176634e-19
 c    = 2.99792458e8
 
+# a, c in Angstrom; V_I in eV; nu = Poisson ratio
 CRYSTAL_PRESETS = {
-    "SrTiO3": {"a": 3.905e-10, "V_I": 15.08},
-    "LSMO":   {"a": 3.876e-10, "V_I": 14.0},
-    "Cu":     {"a": 3.615e-10, "V_I": 12.0},
+    # ── Substrates ────────────────────────────────────────────────────────────
+    "SrTiO3":     {"a": 3.905, "c": 3.905, "V_I": 15.08, "nu": 0.23, "group": "Substrate"},
+    "LaAlO3":     {"a": 3.787, "c": 3.787, "V_I": 13.5,  "nu": 0.24, "group": "Substrate"},
+    "MgO":        {"a": 4.211, "c": 4.211, "V_I": 13.0,  "nu": 0.18, "group": "Substrate"},
+    "LSAT":       {"a": 3.868, "c": 3.868, "V_I": 13.8,  "nu": 0.24, "group": "Substrate"},
+    # ── Oxide films ───────────────────────────────────────────────────────────
+    "LSMO":       {"a": 3.876, "c": 3.876, "V_I": 14.0,  "nu": 0.25, "group": "Oxide film"},
+    "BaTiO3":     {"a": 3.994, "c": 4.038, "V_I": 16.0,  "nu": 0.25, "group": "Oxide film"},
+    "LaNiO3":     {"a": 3.838, "c": 3.838, "V_I": 14.5,  "nu": 0.25, "group": "Oxide film"},
+    "SrRuO3":     {"a": 3.930, "c": 3.930, "V_I": 15.5,  "nu": 0.25, "group": "Oxide film"},
+    "BiFeO3":     {"a": 3.965, "c": 3.965, "V_I": 15.0,  "nu": 0.25, "group": "Oxide film"},
+    # ── Metals ────────────────────────────────────────────────────────────────
+    "Cu":         {"a": 3.615, "c": 3.615, "V_I": 12.0,  "nu": 0.34, "group": "Metal"},
+    "Pt":         {"a": 3.924, "c": 3.924, "V_I": 18.0,  "nu": 0.38, "group": "Metal"},
+    "Fe":         {"a": 2.870, "c": 2.870, "V_I": 11.5,  "nu": 0.29, "group": "Metal"},
 }
+
+SUBSTRATE_LIST = [k for k, v in CRYSTAL_PRESETS.items() if v["group"] == "Substrate"]
+FILM_LIST      = [k for k, v in CRYSTAL_PRESETS.items() if v["group"] != "Substrate"]
 
 # ============================================================================
 #  Physics helpers
@@ -55,16 +71,28 @@ def ki_vec(Ki, theta_deg, azimuth_deg=0.0):
     K_iY = K_iX_0 * np.sin(phi)
     return K_iX, K_iY, K_iZ
 
-def surface_g_vecs(a, hmax):
-    b = 2.0 * np.pi / a
+def strained_c(a_bulk_A, c_bulk_A, a_in_A, nu):
+    """
+    Pseudomorphic strain: in-plane forced to a_in,
+    out-of-plane relaxes via Poisson ratio.
+    c_strained = c_bulk - 2*nu/(1-nu) * (a_in - a_bulk) * c_bulk/a_bulk
+    """
+    eps_in = (a_in_A - a_bulk_A) / a_bulk_A
+    c_out  = c_bulk_A * (1.0 - 2.0 * nu / (1.0 - nu) * eps_in)
+    return c_out
+
+def surface_g_vecs(a_in_m, hmax):
+    b = 2.0 * np.pi / a_in_m
     return np.array([[h*b, k*b]
                      for h in range(-hmax, hmax+1)
                      for k in range(-hmax, hmax+1)
                      if not (h==0 and k==0)])
 
-def bulk_G_vecs(a, hmax):
-    b = 2.0 * np.pi / a
-    return np.array([[h*b, k*b, l*b]
+def bulk_G_vecs(a_in_m, c_out_m, hmax):
+    """Tetragonal reciprocal lattice: a_in for XY, c_out for Z."""
+    b_in  = 2.0 * np.pi / a_in_m
+    b_out = 2.0 * np.pi / c_out_m
+    return np.array([[h*b_in, k*b_in, l*b_out]
                      for h in range(-hmax, hmax+1)
                      for k in range(-hmax, hmax+1)
                      for l in range(-hmax, hmax+1)
@@ -83,9 +111,9 @@ def _quadratic_K_fy(R, GX, GY, q):
     Gp2 = GX**2 + GY**2
     if Gp2 == 0:
         return []
-    a_c = Gp2
-    b_c = -R * GY
-    c_c = R**2 / 4.0 - GX**2 * q
+    a_c  = Gp2
+    b_c  = -R * GY
+    c_c  = R**2 / 4.0 - GX**2 * q
     disc = b_c**2 - 4.0 * a_c * c_c
     if disc < 0:
         return []
@@ -96,9 +124,9 @@ def _quadratic_K_fy(R, GX, GY, q):
 #  Bragg spots
 # ============================================================================
 
-def compute_bragg_spots(Ki, theta_deg, a, azimuth_deg=0.0, hmax=4, L=0.2):
+def compute_bragg_spots(Ki, theta_deg, a_in_m, azimuth_deg=0.0, hmax=4, L=0.2):
     K_iX, K_iY, K_iZ = ki_vec(Ki, theta_deg, azimuth_deg)
-    b = 2.0 * np.pi / a
+    b = 2.0 * np.pi / a_in_m
     spots = []
     for h in range(-hmax, hmax+1):
         for k in range(-hmax, hmax+1):
@@ -112,11 +140,10 @@ def compute_bragg_spots(Ki, theta_deg, a, azimuth_deg=0.0, hmax=4, L=0.2):
     return spots
 
 # ============================================================================
-#  Bragg Kikuchi lines
+#  Bragg Kikuchi lines  (Eq.5 Pawlak / Eq.1 Mitura)
 # ============================================================================
 
-def bragg_kikuchi_line(G, Ki, theta_deg, v_tilde, azimuth_deg=0.0,
-                       L=0.2, y_range=(-80,80), npts=500):
+def bragg_kikuchi_line(G, Ki, v_tilde, L=0.2, y_range=(-80,80), npts=500):
     GX, GY, GZ = G
     G2 = GX**2 + GY**2 + GZ**2
     pts_Y, pts_Z = [], []
@@ -160,11 +187,10 @@ def bragg_kikuchi_line(G, Ki, theta_deg, v_tilde, azimuth_deg=0.0,
     return pts_Y, pts_Z
 
 # ============================================================================
-#  Resonance lines
+#  Resonance lines  (Eq.8 Pawlak / Eq.3 Mitura)
 # ============================================================================
 
-def resonance_line(g, Ki, theta_deg, v_tilde, alpha=1.0,
-                   L=0.2, y_range=(-80,80), npts=500):
+def resonance_line(g, Ki, v_tilde, alpha=1.0, L=0.2, y_range=(-80,80), npts=500):
     gX, gY = g
     g2 = gX**2 + gY**2
     pts_Y, pts_Z = [], []
@@ -206,17 +232,17 @@ def filter_rheed_image(img_array, kernel_size=15):
     return ahe.astype(np.float32)
 
 # ============================================================================
-#  Core plotting function
+#  Core plotting  (cached)
 # ============================================================================
 
 @st.cache_data(show_spinner=False)
-def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
+def build_figure(a_in_A, c_out_A, V_I, label,
+                 energy_keV, theta_deg, azimuth_deg, L_mm,
                  hmax_3d, hmax_2d, show_spots, show_bragg, show_resonance,
                  y_min, y_max, z_min, z_max, img_bytes, kernel_size):
 
-    preset = CRYSTAL_PRESETS[crystal_name]
-    a   = preset["a"]
-    V_I = preset["V_I"]
+    a_in  = a_in_A  * 1e-10
+    c_out = c_out_A * 1e-10
     Ki  = ki_magnitude(energy_keV)
     vt  = reduced_potential(V_I, energy_keV)
     L   = L_mm * 1e-3
@@ -226,13 +252,12 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
     fig, ax = plt.subplots(figsize=(11, 7))
     ax.set_facecolor("black")
     fig.patch.set_facecolor("#111111")
-
     stats = {}
 
     # Background RHEED image
     if img_bytes is not None:
         import skimage.io as skio
-        raw = skio.imread(io.BytesIO(img_bytes))
+        raw  = skio.imread(io.BytesIO(img_bytes))
         filt = filter_rheed_image(raw, kernel_size)
         ax.imshow(filt, cmap="gray",
                   extent=[y_min, y_max, z_min, z_max],
@@ -240,7 +265,7 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
 
     # Bragg spots
     if show_spots:
-        spots = compute_bragg_spots(Ki, theta_deg, a, azimuth_deg, hmax=hmax_3d, L=L)
+        spots   = compute_bragg_spots(Ki, theta_deg, a_in, azimuth_deg, hmax=hmax_3d, L=L)
         visible = [(y, z) for y, z in spots
                    if y_range[0]<=y<=y_range[1] and z_range[0]<=z<=z_range[1]]
         if visible:
@@ -251,9 +276,8 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
     # Bragg Kikuchi lines
     if show_bragg:
         n = 0
-        for G in bulk_G_vecs(a, hmax_3d):
-            py, pz = bragg_kikuchi_line(G, Ki, theta_deg, vt,
-                                        L=L, y_range=y_range)
+        for G in bulk_G_vecs(a_in, c_out, hmax_3d):
+            py, pz = bragg_kikuchi_line(G, Ki, vt, L=L, y_range=y_range)
             mask = [z_range[0]<=z<=z_range[1] for z in pz]
             py2  = [y for y,m in zip(py,mask) if m]
             pz2  = [z for z,m in zip(pz,mask) if m]
@@ -267,9 +291,8 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
     # Resonance lines
     if show_resonance:
         n = 0
-        for g in surface_g_vecs(a, hmax_2d):
-            py, pz = resonance_line(g, Ki, theta_deg, vt,
-                                    L=L, y_range=y_range)
+        for g in surface_g_vecs(a_in, hmax_2d):
+            py, pz = resonance_line(g, Ki, vt, L=L, y_range=y_range)
             mask = [z_range[0]<=z<=z_range[1] for z in pz]
             py2  = [y for y,m in zip(py,mask) if m]
             pz2  = [z for z,m in zip(pz,mask) if m]
@@ -280,7 +303,7 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
                 n += 1
         stats["resonance_lines"] = n
 
-    # Legend
+    # Legend + decoration
     handles = []
     if show_spots:
         handles.append(mpatches.Patch(color="lime",       label="Bragg spots"))
@@ -294,21 +317,20 @@ def build_figure(crystal_name, energy_keV, theta_deg, azimuth_deg, L_mm,
 
     ax.set_xlim(y_range)
     ax.set_ylim(z_range)
-    ax.invert_yaxis()   # shadow edge at top, matching paper convention
-    ax.set_xlabel("Y  [mm]  (horizontal, perp beam)", color="white", fontsize=11)
+    ax.invert_yaxis()
+    ax.set_xlabel("Y  [mm]  (horizontal, perp beam)",     color="white", fontsize=11)
     ax.set_ylabel("Z  [mm]  (distance from shadow edge)", color="white", fontsize=11)
     ax.tick_params(colors="white")
     for spine in ax.spines.values():
         spine.set_edgecolor("#555555")
     ax.axhline(0, color="#555555", lw=0.5, ls="--")
-    ax.text(y_min + 1, 0.5, "shadow edge", color="#888888", fontsize=7, va="top")
-    ax.set_title(
-        f"RHEED Kikuchi  --  {crystal_name} (001)  |  "
-        f"E={energy_keV} keV   theta={theta_deg} deg   phi={azimuth_deg} deg   L={L_mm} mm",
-        color="white", fontsize=9
-    )
+    ax.text(y_min+1, 0.5, "shadow edge", color="#888888", fontsize=7, va="top")
+
+    title = (f"RHEED Kikuchi  --  {label}  |  "
+             f"E={energy_keV} keV   theta={theta_deg} deg   phi={azimuth_deg} deg   L={L_mm} mm")
+    ax.set_title(title, color="white", fontsize=9)
     fig.tight_layout()
-    return fig, stats, Ki, vt
+    return fig, stats
 
 # ============================================================================
 #  Streamlit UI
@@ -320,20 +342,68 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("RHEED Kikuchi Line Simulator")
+st.title("🔬 RHEED Kikuchi Line Simulator")
 st.caption("Bragg reflection & resonance scattering lines | Pawlak 2021 · Mitura 2024")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Parameters")
+    st.header("Crystal")
 
-    crystal = st.selectbox("Crystal", list(CRYSTAL_PRESETS.keys()))
+    mode = st.radio("Mode", ["Substrate", "Epitaxial Film on Substrate"],
+                    horizontal=True)
 
-    preset_info = CRYSTAL_PRESETS[crystal]
-    st.caption(f"a = {preset_info['a']*1e10:.3f} Å   |   V_I = {preset_info['V_I']} eV")
+    if mode == "Substrate":
+        substrate = st.selectbox("Substrate", list(CRYSTAL_PRESETS.keys()),
+                                 index=list(CRYSTAL_PRESETS.keys()).index("SrTiO3"))
+        p = CRYSTAL_PRESETS[substrate]
+        a_in_A  = p["a"]
+        c_out_A = p["c"]
+        V_I     = p["V_I"]
+        label   = f"{substrate} (001)"
+        st.caption(f"a = {a_in_A:.3f} Å  |  c = {c_out_A:.3f} Å  |  V_I = {V_I} eV")
+
+    else:  # Epitaxial film
+        col_sub, col_film = st.columns(2)
+        substrate = col_sub.selectbox("Substrate",  SUBSTRATE_LIST)
+        film      = col_film.selectbox("Film",       FILM_LIST)
+
+        p_sub  = CRYSTAL_PRESETS[substrate]
+        p_film = CRYSTAL_PRESETS[film]
+
+        a_in_A    = p_sub["a"]          # in-plane locked to substrate
+        c_bulk_A  = p_film["c"]
+        nu        = p_film["nu"]
+
+        c_auto_A  = strained_c(p_film["a"], c_bulk_A, a_in_A, nu)
+        strain_pct = (a_in_A - p_film["a"]) / p_film["a"] * 100
+
+        V_I   = p_film["V_I"]
+        label = f"{film}/{substrate} (001)"
+
+        st.info(
+            f"In-plane  a = **{a_in_A:.3f} Å** (substrate)\n\n"
+            f"Film bulk a = {p_film['a']:.3f} Å  →  "
+            f"strain = **{strain_pct:+.2f}%**"
+        )
+
+        strain_type = st.radio("Strain state", ["Fully strained (pseudomorphic)",
+                                                 "Fully relaxed (bulk)",
+                                                 "Manual c"],
+                               horizontal=False)
+        if strain_type == "Fully strained (pseudomorphic)":
+            c_out_A = c_auto_A
+            st.caption(f"c_out = {c_out_A:.3f} Å  (Poisson, nu={nu})")
+        elif strain_type == "Fully relaxed (bulk)":
+            c_out_A = c_bulk_A
+            st.caption(f"c_out = {c_out_A:.3f} Å  (bulk, no strain)")
+        else:
+            c_out_A = st.slider("c out-of-plane (Å)", 3.5, 4.5,
+                                float(round(c_auto_A, 3)), 0.001, format="%.3f")
+
+        st.caption(f"V_I = {V_I} eV  (film)")
 
     st.divider()
-
+    st.subheader("Beam & Geometry")
     energy  = st.slider("Beam energy (keV)", 5.0, 100.0, 20.0, 0.5)
     theta   = st.slider("Glancing angle theta (deg)", 0.5, 10.0, 2.9, 0.1)
     azimuth = st.slider("Azimuth phi (deg)", -45.0, 45.0, 0.0, 0.5)
@@ -341,8 +411,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Reciprocal lattice")
-    hmax_3d = st.slider("hmax  (3D, Bragg/Kikuchi)", 1, 6, 4)
-    hmax_2d = st.slider("hmax  (2D, resonance)",     1, 6, 4)
+    hmax_3d = st.slider("hmax  (3D Bragg/Kikuchi)", 1, 6, 4)
+    hmax_2d = st.slider("hmax  (2D resonance)",     1, 6, 4)
 
     st.divider()
     st.subheader("Screen window (mm)")
@@ -360,29 +430,38 @@ with st.sidebar:
 
     st.divider()
     st.subheader("RHEED image (optional)")
-    uploaded = st.file_uploader("Upload .tif / .png image", type=["tif","tiff","png","jpg"])
-    kernel_size = st.slider("AHE kernel size (px)", 5, 50, 15, step=5,
-                            help="Adaptive histogram equalization window")
+    uploaded    = st.file_uploader("Upload .tif / .png image",
+                                   type=["tif","tiff","png","jpg"])
+    kernel_size = st.slider("AHE kernel size (px)", 5, 50, 15, step=5)
 
 # ── Main panel ───────────────────────────────────────────────────────────────
 img_bytes = uploaded.read() if uploaded else None
 
-z_spec = np.tan(np.radians(theta)) * L_mm
+Ki_val  = ki_magnitude(energy)
+vt_val  = reduced_potential(V_I, energy)
+z_spec  = np.tan(np.radians(theta)) * L_mm
 
-# Physics info bar
-c1, c2, c3, c4 = st.columns(4)
-Ki_val = ki_magnitude(energy)
-vt_val = reduced_potential(preset_info["V_I"], energy)
-c1.metric("Beam energy",    f"{energy} keV")
-c2.metric("|Ki|",           f"{Ki_val:.3e} m⁻¹")
-c3.metric("v_tilde",        f"{vt_val:.3e} m⁻²")
-c4.metric("Specular Z_s",   f"{z_spec:.1f} mm")
+# Info bar
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Beam energy",   f"{energy} keV")
+c2.metric("|Ki|",          f"{Ki_val:.3e} m⁻¹")
+c3.metric("v_tilde",       f"{vt_val:.3e} m⁻²")
+c4.metric("Specular Z_s",  f"{z_spec:.1f} mm")
+c5.metric("a / c",         f"{a_in_A:.3f} / {c_out_A:.3f} Å")
+
+if mode == "Epitaxial Film on Substrate":
+    tetra_distort = (c_out_A - a_in_A) / a_in_A * 100
+    st.caption(
+        f"Tetragonal distortion: c/a = {c_out_A/a_in_A:.4f}  "
+        f"({tetra_distort:+.2f}%)"
+    )
 
 st.divider()
 
 with st.spinner("Computing Kikuchi pattern..."):
-    fig, stats, Ki_val, vt_val = build_figure(
-        crystal, energy, theta, azimuth, L_mm,
+    fig, stats = build_figure(
+        a_in_A, c_out_A, V_I, label,
+        energy, theta, azimuth, L_mm,
         hmax_3d, hmax_2d,
         show_spots, show_bragg, show_resonance,
         float(y_min), float(y_max), float(z_min), float(z_max),
@@ -394,11 +473,11 @@ st.pyplot(fig, use_container_width=True)
 # Stats row
 if stats:
     s1, s2, s3 = st.columns(3)
-    if "spots"         in stats: s1.info(f"**{stats['spots']}** Bragg spots")
-    if "bragg_lines"   in stats: s2.info(f"**{stats['bragg_lines']}** Bragg Kikuchi lines")
+    if "spots"           in stats: s1.info(f"**{stats['spots']}** Bragg spots")
+    if "bragg_lines"     in stats: s2.info(f"**{stats['bragg_lines']}** Bragg Kikuchi lines")
     if "resonance_lines" in stats: s3.info(f"**{stats['resonance_lines']}** resonance lines")
 
-# Download button
+# Download
 buf = io.BytesIO()
 fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
             facecolor=fig.get_facecolor())
@@ -406,7 +485,7 @@ buf.seek(0)
 st.download_button(
     label="Download PNG",
     data=buf,
-    file_name=f"rheed_kikuchi_{crystal}_E{energy}keV_th{theta}deg.png",
+    file_name=f"rheed_kikuchi_{label.replace('/','_')}_E{energy}keV_th{theta}deg.png",
     mime="image/png",
 )
 
@@ -417,20 +496,16 @@ with st.expander("About"):
     st.markdown("""
 **RHEED Kikuchi Line Simulator**
 
-Computes three types of features on the RHEED screen:
-
 | Color | Feature | Equation |
 |-------|---------|----------|
 | 🟢 Green | Bragg diffraction spots | Ewald sphere + 2D periodicity |
 | 🔵 Blue | Bragg reflection Kikuchi lines | Eq. 5 (Pawlak 2021) / Eq. 1 (Mitura 2024) |
 | 🔴 Red | Resonance scattering lines | Eq. 8 (Pawlak 2021) / Eq. 3 (Mitura 2024) |
 
-**Coordinate system:**  X = beam direction, Y = horizontal (⊥ beam), Z = surface normal (up).
-The screen is vertical at distance L from the sample.
-
-**Image filter** (when a RHEED image is uploaded):
-- RDB: Remove Dynamic Background via Gaussian subtraction
-- AHE: Adaptive Histogram Equalization (scikit-image)
+**Crystal support:**
+- **Cubic**: a = c (SrTiO3, LSMO, Cu …)
+- **Tetragonal**: a ≠ c (BaTiO3, strained films …)
+- **Epitaxial film mode**: in-plane a locked to substrate, c_out computed from Poisson ratio or set manually
 
 **References:**
 - Pawlak, Przybylski & Mitura, *Materials* **14**, 7077 (2021)
